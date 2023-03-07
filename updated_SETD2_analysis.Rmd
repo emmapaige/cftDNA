@@ -1,0 +1,2282 @@
+---
+title: "SETD2 Mutation Analysis"
+author: "Carson Mosso"
+date: "02/16/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+
+set.seed(1234)
+library(here)
+library(tidyverse)
+library(GGally)
+library(mda)
+library(randomForest)
+library(varImp)
+
+library(glmnet)
+library(survival)
+library(survminer)
+# library(gbm)
+```
+
+```{r}
+gene_location_regex_string <- "^(.)([[:digit:]]+)(.*)$"
+
+quart <- function(x) {
+  x <- sort(x)
+  n <- length(x)
+  m <- (n+1)/2
+  if (floor(m) != m) {
+    l <- m-1/2; u <- m+1/2
+  } else {
+    l <- m-1; u <- m+1
+  }
+  c(Q1 = median(x[1:l]), Q2 = median(x), Q3 = median(x[u:n]))
+}
+
+generate_cv_idcs_ls <- function(idcs, fold) {
+  
+  dummy_idcs <- sample(idcs)
+  
+  step_size <- length(idcs) %/% fold
+  remainder <- length(idcs) %% fold
+  
+  idcs_ls <- rep(list(step_size), fold)
+  out_ls <- rep(list(NULL), fold)
+  
+  if (remainder > 0) {
+    for (i in 1:remainder) {
+      idcs_ls[[i]] <- step_size + 1
+    }
+  }
+  cumsum_idcs <- cumsum(unlist(idcs_ls))
+  
+  out_ls[[1]] <- dummy_idcs[1:idcs_ls[[1]]]
+  for (i in 2:fold) {
+    out_ls[[i]] <- dummy_idcs[(cumsum_idcs[i-1] + 1:idcs_ls[[i]])]
+  }
+  
+  return(out_ls)
+}
+
+add_minority_class_data <- function(df, pad = -3:3) {
+  
+  out_ls <- rep(list(NULL), length(pad))
+  for (i in seq_along(pad)) {
+    dummy_df <- df
+    if (i != 0) dummy_df$location <- dummy_df$location + i
+    out_ls[[i]] <- dummy_df
+  }
+  return(bind_rows(out_ls))
+}
+
+make_model_tb <- function(df, pad = -3:3) {
+  
+  alive_df <- df %>% 
+    filter(vital_status == "Alive")
+  dead_df <- df %>% 
+    filter(vital_status == "Dead") %>% 
+    add_minority_class_data(pad = pad)
+  
+  out_df <- bind_rows(alive_df, dead_df)
+}
+
+generate_cv_df_ls <- function(df, fold, pad = -3:3) {
+  
+  #### add synthetic data before random subsetting of data
+  temp_df <- make_model_tb(df, pad = pad)
+  
+  temp_alive_df <- temp_df %>% 
+    filter(vital_status == "Alive")
+  temp_dead_df <- temp_df %>% 
+    filter(vital_status == "Dead")
+  
+  temp_alive_idcs_ls <- generate_cv_idcs_ls(idcs = 1:nrow(temp_alive_df), fold = fold)
+  temp_dead_idcs_ls <- generate_cv_idcs_ls(idcs = 1:nrow(temp_dead_df), fold = fold)
+  temp_df_ls <- rep(list(NULL), fold)
+  
+  for (i in 1:fold) {
+    #### this helps make the data evenly distributed
+    dummy_dead_df <- temp_dead_df[temp_dead_idcs_ls[[((fold+1) - i)]], ]
+    # dummy_dead_df <- temp_dead_df[temp_dead_idcs_ls[[((fold+1) - i)]], ] %>% 
+    #   add_minority_class_data()
+    
+    temp_df_ls[[i]] <- bind_rows(temp_alive_df[temp_alive_idcs_ls[[i]], ],
+                                 dummy_dead_df)
+  }
+  
+  return(temp_df_ls)
+}
+
+generate_cv_error_vec <- function(cv_df_ls, method = "mda", class_vec, n.trees) {
+  
+  error_vec <- rep(NA, length(cv_df_ls))
+  
+  for (i in seq_along(cv_df_ls)) {
+    
+    if (method == "mda") {
+      model <- mda(vital_response ~ location, bind_rows(cv_df_ls[-i]), class_vec)
+      error_vec[i] <- attr(confusion(model, cv_df_ls[[i]]), "error")
+      remove(model)
+    } else if (method == "randomForest") {
+      model <- randomForest(vital_response ~ location,
+                            data = bind_rows(cv_df_ls[-i]),
+                            ntree = n.trees)
+      error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+      remove(model)
+    }
+  }
+  
+  return(error_vec)
+}
+
+generate_cv_error_tb <- function(df, fold, subclasses_ls = NULL, n.trees = NULL, pad = -3:3) {
+  
+  cv_df_ls <- generate_cv_df_ls(df, fold, pad)
+  
+  if (is.null(subclasses_ls)) {
+    subclasses_ls <- rep(list(NULL), 9*9)
+    # subclasses_ls <- list(c(2, 2), c(3, 3), c(4, 4), c(5, 5),
+    #                       c(2, 3), c(3, 2), c(2, 4), c(4, 2),
+    #                       c(3, 4), c(4, 3), c(4, 5), c(5, 4))
+    dummy_count <- 0
+    for (i in 2:10) {
+      for (j in 2:10) {
+        dummy_count <- dummy_count + 1
+        subclasses_ls[[dummy_count]] <- c(i, j)
+      }
+    }
+  }
+  
+  if (is.null(n.trees)) {
+    n.trees <- c(5, 10, 25, 50)
+  }
+  
+  for (i in seq_along(subclasses_ls)) {
+    
+    error_vec <- generate_cv_error_vec(cv_df_ls, method = "mda", class_vec = subclasses_ls[[i]])
+    
+    if (i == 1) {
+      error_tb <- tibble(gene_mutation = unique(df$gene_mutation),
+                         mutation_type = unique(df$mutation_type),
+                         model = "MDA",
+                         parameter = str_c(subclasses_ls[[i]][1], subclasses_ls[[i]][2], sep = "-"),
+                         folds = fold,
+                         subclasses_1 = subclasses_ls[[i]][1],
+                         subclasses_2 = subclasses_ls[[i]][2],
+                         n.trees = NA,
+                         mean.error = mean(error_vec, na.rm = TRUE),
+                         median.error = median(error_vec, na.rm = TRUE),
+                         sd.error = sd(error_vec, na.rm = TRUE))
+    } else {
+      error_tb <- tibble(gene_mutation = unique(df$gene_mutation),
+                         mutation_type = unique(df$mutation_type),
+                         model = "MDA",
+                         parameter = str_c(subclasses_ls[[i]][1], subclasses_ls[[i]][2], sep = "-"),
+                         folds = fold,
+                         subclasses_1 = subclasses_ls[[i]][1],
+                         subclasses_2 = subclasses_ls[[i]][2],
+                         n.trees = NA,
+                         mean.error = mean(error_vec, na.rm = TRUE),
+                         median.error = median(error_vec, na.rm = TRUE),
+                         sd.error = sd(error_vec, na.rm = TRUE)) %>% 
+        bind_rows(error_tb)
+    }
+  }
+  
+  for (i in seq_along(n.trees)) {
+    
+    error_vec <- generate_cv_error_vec(cv_df_ls, method = "randomForest", n.trees = n.trees[i])
+    
+    error_tb <- tibble(gene_mutation = unique(df$gene_mutation),
+                       mutation_type = unique(df$mutation_type),
+                       model = "Random_Forest",
+                       parameter = as.character(n.trees[i]),
+                       folds = fold,
+                       subclasses_1 = NA,
+                       subclasses_2 = NA,
+                       num.trees = n.trees[i],
+                       mean.error = mean(error_vec, na.rm = TRUE),
+                       median.error = median(error_vec, na.rm = TRUE),
+                       sd.error = sd(error_vec, na.rm = TRUE)) %>% 
+      bind_rows(error_tb)
+  }
+  
+  
+  return(error_tb)
+}
+
+gene_mutation_mda_error_tb <- function(df, missense_only = FALSE) {
+  
+  if (missense_only) {
+    error_ls <- rep(list(NULL), 3)
+  } else {
+    error_ls <- rep(list(NULL), 6)
+  }
+  
+  temp_df <- df %>% 
+    filter(mutation_type == "Missense")
+  
+  
+  error_ls[[1]] <- generate_cv_error_tb(df = temp_df, fold = 5)
+  error_ls[[2]] <- generate_cv_error_tb(df = temp_df, fold = 8)
+  error_ls[[3]] <- generate_cv_error_tb(df = temp_df, fold = 10)
+  
+  if (!missense_only) {
+    temp_df <- df %>% 
+      filter(mutation_type == "Nonsense_Frame_Shift")
+    
+    error_ls[[4]] <- generate_cv_error_tb(df = temp_df, fold = 5)
+    error_ls[[5]] <- generate_cv_error_tb(df = temp_df, fold = 8)
+    error_ls[[6]] <- generate_cv_error_tb(df = temp_df, fold = 10)
+  }
+  
+  return(bind_rows(error_ls))
+}
+```
+
+```{r}
+#### SETD2 and other relavent gene mutation datasets
+
+#### url: http://www.cbioportal.org/results/cancerTypesSummary?case_set_id=all&gene_list=SETD2&cancer_study_list=5c8a7d55e4b046111fee2296
+#### load data from 2021-09-07_work.R script
+# setd2_cbioportal_df <- read_rds(here("data", "SETD2_cbioportal_df.rds")) %>% 
+#   rename(patient = PATIENT_ID)
+# nsd2_cbioportal_df <- read_rds(here("data", "NSD2_cbioportal_df.rds")) %>% 
+#   rename(patient = PATIENT_ID)
+# pbrm1_cbioportal_df <- read_rds(here("data", "PBRM1_cbioportal_df.rds")) %>% 
+#   rename(patient = PATIENT_ID)
+# kmt2c_cbioportal_df <- read_rds(here("data", "KMT2C_cbioportal_df.rds")) %>% 
+#   rename(patient = PATIENT_ID)
+# arid1a_cbioportal_df <- read_rds(here("data", "ARID1A_cbioportal_df.rds")) %>% 
+#   rename(patient = PATIENT_ID)
+
+setd2_mutations_tab <- read_tsv(file = here("data", "cBioPortal_SETD2_Mutations_tab.tsv"),
+                                col_names = TRUE) %>% 
+  select(`Sample ID`, `Diagnosis Age`, `Protein Change`, `Mutation Type`:`Copy #`, `Chromosome`:`Var`, `Allele Freq (T)`:`Exon`) %>% 
+  rename(Barcode_ID = `Sample ID`) %>% 
+  mutate(Barcode_ID = str_sub(Barcode_ID, start = 1, end = 12))
+
+nsd2_mutations_tab <- read_tsv(file = here("data", "cBioPortal_NSD2_Mutations_tab.tsv"),
+                               col_names = TRUE) %>% 
+  select(`Sample ID`, `Diagnosis Age`, `Protein Change`, `Mutation Type`:`Copy #`, `Chromosome`:`Var`, `Allele Freq (T)`:`Exon`) %>% 
+  rename(Barcode_ID = `Sample ID`) %>% 
+  mutate(Barcode_ID = str_sub(Barcode_ID, start = 1, end = 12))
+
+pbrm1_mutations_tab <- read_tsv(file = here("data", "cBioPortal_PBRM1_Mutations_tab.tsv"),
+                                col_names = TRUE) %>% 
+  select(`Sample ID`, `Diagnosis Age`, `Protein Change`, `Mutation Type`:`Copy #`, `Chromosome`:`Var`, `Allele Freq (T)`:`Exon`) %>% 
+  rename(Barcode_ID = `Sample ID`) %>% 
+  mutate(Barcode_ID = str_sub(Barcode_ID, start = 1, end = 12))
+
+kmt2c_mutations_tab <- read_tsv(file = here("data", "cBioPortal_KMT2C_Mutations_tab.tsv"),
+                                col_names = TRUE) %>% 
+  select(`Sample ID`, `Diagnosis Age`, `Protein Change`, `Mutation Type`:`Copy #`, `Chromosome`:`Var`, `Allele Freq (T)`:`Exon`) %>% 
+  rename(Barcode_ID = `Sample ID`) %>% 
+  mutate(Barcode_ID = str_sub(Barcode_ID, start = 1, end = 12))
+
+arid1a_mutations_tab <- read_tsv(file = here("data", "cBioPortal_ARID1A_Mutations_tab.tsv"),
+                                 col_names = TRUE) %>% 
+  select(`Sample ID`, `Diagnosis Age`, `Protein Change`, `Mutation Type`:`Copy #`, `Chromosome`:`Var`, `Allele Freq (T)`:`Exon`) %>% 
+  rename(Barcode_ID = `Sample ID`) %>% 
+  mutate(Barcode_ID = str_sub(Barcode_ID, start = 1, end = 12))
+
+# #### url: http://www.tumorportal.org/view?geneSymbol=SETD2
+# #### MAF file: https://docs.gdc.cancer.gov/Data/File_Formats/MAF_Format/#:~:text=Mutation%20Annotation%20Format%20(MAF)%20is,generated%20on%20a%20project%2Dlevel.&text=maf)%2C%20which%20are%20also%20known,quality%20and%20potential%20germline%20variants.
+# tumorportal_df <- read_delim(here("data", "SETD2.maf"),
+#                              delim = "\t",
+#                              col_names = TRUE)
+# tumorportal_df
+# 
+# tumorportal_df %>% 
+#   count(ttype) %>% 
+#   arrange(desc(n))
+
+######################################################################
+######################################################################
+
+#### clinical patient datasets
+#### https://portal.gdc.cancer.gov/legacy-archive/search/f?filters=%7B%22op%22:%22and%22,%22content%22:%5B%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.data_category%22,%22value%22:%5B%22Clinical%22%5D%7D%7D,%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.data_format%22,%22value%22:%5B%22Biotab%22%5D%7D%7D%5D%7D
+
+#### skip the first two rows that seem to have extra column titles
+gdc_kirc_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "KIRC", "clinical_patient", "kirc_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_kirc_clinical_patient_df <- gdc_kirc_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_blca_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "BLCA", "clinical_patient", "blca_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_blca_clinical_patient_df <- gdc_blca_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_brca_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "BRCA", "clinical_patient", "brca_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_brca_clinical_patient_df <- gdc_brca_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_dlbc_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "DLBC", "clinical_patient", "dlbc_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_dlbc_clinical_patient_df <- gdc_dlbc_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_gbm_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "GBM", "clinical_patient", "gbm_biotab.txt"),
+                                          delim = "\t",
+                                          col_names = TRUE)
+gdc_gbm_clinical_patient_df <- gdc_gbm_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_hnsc_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "HNSC", "clinical_patient", "hnsc_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_hnsc_clinical_patient_df <- gdc_hnsc_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_laml_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "LAML", "clinical_patient", "laml_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_laml_clinical_patient_df <- gdc_laml_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_luad_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "LUAD", "clinical_patient", "luad_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_luad_clinical_patient_df <- gdc_luad_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_lusc_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "LUSC", "clinical_patient", "lusc_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_lusc_clinical_patient_df <- gdc_lusc_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_meso_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "MESO", "clinical_patient", "meso_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_meso_clinical_patient_df <- gdc_meso_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_ov_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "OV", "clinical_patient", "ov_biotab.txt"),
+                                         delim = "\t",
+                                         col_names = TRUE)
+gdc_ov_clinical_patient_df <- gdc_ov_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+gdc_ucec_clinical_patient_df <- read_delim(here("data", "gdc_TCGA", "UCEC", "clinical_patient", "ucec_biotab.txt"),
+                                           delim = "\t",
+                                           col_names = TRUE)
+gdc_ucec_clinical_patient_df <- gdc_ucec_clinical_patient_df[-c(1, 2), ] %>% 
+  rename(Barcode_ID = bcr_patient_barcode)
+
+######################################################################
+######################################################################
+
+kirc_patient_tb <- gdc_kirc_clinical_patient_df %>% 
+  mutate(ttype = "KIRC") %>% 
+  rename(age_at_diagnosis = age_at_initial_pathologic_diagnosis) %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, gender, race, ethnicity)
+
+ucec_patient_tb <- gdc_ucec_clinical_patient_df %>% 
+  mutate(ttype = "UCEC") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, gender, race, ethnicity)
+
+luad_patient_tb <- gdc_luad_clinical_patient_df %>% 
+  mutate(ttype = "LUAD") %>% 
+  rename(age_at_diagnosis = age_at_initial_pathologic_diagnosis) %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, gender, race, ethnicity)
+
+hnsc_patient_tb <- gdc_hnsc_clinical_patient_df %>% 
+  mutate(ttype = "HNSC") %>% 
+  rename(age_at_diagnosis = age_at_initial_pathologic_diagnosis) %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, gender, race, ethnicity)
+
+blca_patient_tb <- gdc_blca_clinical_patient_df %>% 
+  mutate(ttype = "BLCA") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, gender, race, ethnicity)
+
+brca_patient_tb <- gdc_brca_clinical_patient_df %>% 
+  mutate(ttype = "BRCA") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, gender, race, ethnicity)
+
+tcga_patient_tb <- rbind(kirc_patient_tb,
+                         ucec_patient_tb,
+                         luad_patient_tb,
+                         brca_patient_tb,
+                         hnsc_patient_tb,
+                         blca_patient_tb) %>% 
+  mutate(tumor_status = if_else(tumor_status %in% c("TUMOR FREE", "WITH TUMOR"),
+                                tumor_status,
+                                "NA"),
+         death_days_to = as.numeric(death_days_to))
+
+tcga_survival_tb <- tcga_patient_tb %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to) %>% 
+  mutate(ttype = parse_factor(ttype,
+                       levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA", "complement"))) %>% 
+  rename(tumor_type = ttype) 
+
+
+######################################################################
+######################################################################
+
+setd2_patient_tb <- left_join(setd2_mutations_tab,
+                              tcga_patient_tb,
+                              by = "Barcode_ID") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, `Diagnosis Age`, 
+         gender, race, ethnicity, `Protein Change`:`Exon`) %>% 
+  mutate(vital_status = if_else(is.na(vital_status) | (vital_status == "[Discrepancy]"),
+                                "Unknown",
+                                vital_status),
+         vital_status = parse_factor(vital_status,
+                                     levels = c("Alive", "Unknown", "Dead"))) %>% 
+  mutate(ttype = if_else(is.na(ttype),
+                         "complement",
+                         ttype),
+         ttype = parse_factor(ttype,
+                              levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA", "complement"))) %>% 
+  rename(cBio_diagnosis_age = `Diagnosis Age`,
+         mutation = `Protein Change`,
+         mutation_type = `Mutation Type`,
+         variant_type = `Variant Type`,
+         copy_number = `Copy #`,
+         chromosome = Chromosome,
+         start_position = `Start Pos`,
+         end_position = `End Pos`,
+         allele_freq_T = `Allele Freq (T)`,
+         allele_freq_N = `Allele Freq (N)`,
+         variant_reads = `Variant Reads`,
+         ref_reads = `Ref Reads`,
+         variant_reads_Normal = `Variant Reads (Normal)`,
+         ref_reads_Normal = `Ref Reads (Normal)`,
+         n_mutation_in_sample = `# Mut in Sample`) %>% 
+  mutate(mutation_class = if_else(mutation_type == "Nonsense_Mutation",
+                                  "Nonsense",
+                                  mutation_type),
+         mutation_class = if_else(mutation_class == "Missense_Mutation",
+                                  "Missense",
+                                  mutation_class),
+         mutation_class = if_else(mutation_class %in% c("Frame_Shift_Del", "Frame_Shift_Ins"),
+                                  "Frame_Shift",
+                                  mutation_class),
+         mutation_class = if_else(!(mutation_class %in% c("Missense",  "Nonsense", "Frame_Shift")),
+                                  "Other",
+                                  mutation_class))
+
+nsd2_patient_tb <- left_join(nsd2_mutations_tab,
+                             tcga_patient_tb,
+                             by = "Barcode_ID") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, `Diagnosis Age`, 
+         gender, race, ethnicity, `Protein Change`:`Exon`) %>% 
+  mutate(vital_status = if_else(is.na(vital_status) | (vital_status == "[Discrepancy]"),
+                                "Unknown",
+                                vital_status),
+         vital_status = parse_factor(vital_status,
+                                     levels = c("Alive", "Unknown", "Dead"))) %>% 
+  mutate(ttype = if_else(is.na(ttype),
+                         "complement",
+                         ttype),
+         ttype = parse_factor(ttype,
+                              levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA", "complement"))) %>% 
+  rename(cBio_diagnosis_age = `Diagnosis Age`,
+         mutation = `Protein Change`,
+         mutation_type = `Mutation Type`,
+         variant_type = `Variant Type`,
+         copy_number = `Copy #`,
+         chromosome = Chromosome,
+         start_position = `Start Pos`,
+         end_position = `End Pos`,
+         allele_freq_T = `Allele Freq (T)`,
+         allele_freq_N = `Allele Freq (N)`,
+         variant_reads = `Variant Reads`,
+         ref_reads = `Ref Reads`,
+         variant_reads_Normal = `Variant Reads (Normal)`,
+         ref_reads_Normal = `Ref Reads (Normal)`,
+         n_mutation_in_sample = `# Mut in Sample`) %>% 
+  mutate(mutation_class = if_else(mutation_type == "Nonsense_Mutation",
+                                  "Nonsense",
+                                  mutation_type),
+         mutation_class = if_else(mutation_class == "Missense_Mutation",
+                                  "Missense",
+                                  mutation_class),
+         mutation_class = if_else(mutation_class %in% c("Frame_Shift_Del", "Frame_Shift_Ins"),
+                                  "Frame_Shift",
+                                  mutation_class),
+         mutation_class = if_else(!(mutation_class %in% c("Missense",  "Nonsense", "Frame_Shift")),
+                                  "Other",
+                                  mutation_class))
+
+pbrm1_patient_tb <- left_join(pbrm1_mutations_tab,
+                              tcga_patient_tb,
+                              by = "Barcode_ID") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, `Diagnosis Age`, 
+         gender, race, ethnicity, `Protein Change`:`Exon`) %>% 
+  mutate(vital_status = if_else(is.na(vital_status) | (vital_status == "[Discrepancy]"),
+                                "Unknown",
+                                vital_status),
+         vital_status = parse_factor(vital_status,
+                                     levels = c("Alive", "Unknown", "Dead"))) %>% 
+  mutate(ttype = if_else(is.na(ttype),
+                         "complement",
+                         ttype),
+         ttype = parse_factor(ttype,
+                              levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA", "complement"))) %>% 
+  rename(cBio_diagnosis_age = `Diagnosis Age`,
+         mutation = `Protein Change`,
+         mutation_type = `Mutation Type`,
+         variant_type = `Variant Type`,
+         copy_number = `Copy #`,
+         chromosome = Chromosome,
+         start_position = `Start Pos`,
+         end_position = `End Pos`,
+         allele_freq_T = `Allele Freq (T)`,
+         allele_freq_N = `Allele Freq (N)`,
+         variant_reads = `Variant Reads`,
+         ref_reads = `Ref Reads`,
+         variant_reads_Normal = `Variant Reads (Normal)`,
+         ref_reads_Normal = `Ref Reads (Normal)`,
+         n_mutation_in_sample = `# Mut in Sample`) %>% 
+  mutate(mutation_class = if_else(mutation_type == "Nonsense_Mutation",
+                                  "Nonsense",
+                                  mutation_type),
+         mutation_class = if_else(mutation_class == "Missense_Mutation",
+                                  "Missense",
+                                  mutation_class),
+         mutation_class = if_else(mutation_class %in% c("Frame_Shift_Del", "Frame_Shift_Ins"),
+                                  "Frame_Shift",
+                                  mutation_class),
+         mutation_class = if_else(!(mutation_class %in% c("Missense",  "Nonsense", "Frame_Shift")),
+                                  "Other",
+                                  mutation_class))
+
+kmt2c_patient_tb <- left_join(kmt2c_mutations_tab,
+                              tcga_patient_tb,
+                              by = "Barcode_ID") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, `Diagnosis Age`, 
+         gender, race, ethnicity, `Protein Change`:`Exon`) %>% 
+  mutate(vital_status = if_else(is.na(vital_status) | (vital_status == "[Discrepancy]"),
+                                "Unknown",
+                                vital_status),
+         vital_status = parse_factor(vital_status,
+                                     levels = c("Alive", "Unknown", "Dead"))) %>% 
+  mutate(ttype = if_else(is.na(ttype),
+                         "complement",
+                         ttype),
+         ttype = parse_factor(ttype,
+                              levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA", "complement"))) %>% 
+  rename(cBio_diagnosis_age = `Diagnosis Age`,
+         mutation = `Protein Change`,
+         mutation_type = `Mutation Type`,
+         variant_type = `Variant Type`,
+         copy_number = `Copy #`,
+         chromosome = Chromosome,
+         start_position = `Start Pos`,
+         end_position = `End Pos`,
+         allele_freq_T = `Allele Freq (T)`,
+         allele_freq_N = `Allele Freq (N)`,
+         variant_reads = `Variant Reads`,
+         ref_reads = `Ref Reads`,
+         variant_reads_Normal = `Variant Reads (Normal)`,
+         ref_reads_Normal = `Ref Reads (Normal)`,
+         n_mutation_in_sample = `# Mut in Sample`) %>% 
+  mutate(mutation_class = if_else(mutation_type == "Nonsense_Mutation",
+                                  "Nonsense",
+                                  mutation_type),
+         mutation_class = if_else(mutation_class == "Missense_Mutation",
+                                  "Missense",
+                                  mutation_class),
+         mutation_class = if_else(mutation_class %in% c("Frame_Shift_Del", "Frame_Shift_Ins"),
+                                  "Frame_Shift",
+                                  mutation_class),
+         mutation_class = if_else(!(mutation_class %in% c("Missense",  "Nonsense", "Frame_Shift")),
+                                  "Other",
+                                  mutation_class))
+
+arid1a_patient_tb <- left_join(arid1a_mutations_tab,
+                               tcga_patient_tb,
+                               by = "Barcode_ID") %>% 
+  select(Barcode_ID, ttype, vital_status, tumor_status, death_days_to, age_at_diagnosis, `Diagnosis Age`, 
+         gender, race, ethnicity, `Protein Change`:`Exon`) %>% 
+  mutate(vital_status = if_else(is.na(vital_status) | (vital_status == "[Discrepancy]"),
+                                "Unknown",
+                                vital_status),
+         vital_status = parse_factor(vital_status,
+                                     levels = c("Alive", "Unknown", "Dead"))) %>% 
+  mutate(ttype = if_else(is.na(ttype),
+                         "complement",
+                         ttype),
+         ttype = parse_factor(ttype,
+                              levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA", "complement"))) %>% 
+  rename(cBio_diagnosis_age = `Diagnosis Age`,
+         mutation = `Protein Change`,
+         mutation_type = `Mutation Type`,
+         variant_type = `Variant Type`,
+         copy_number = `Copy #`,
+         chromosome = Chromosome,
+         start_position = `Start Pos`,
+         end_position = `End Pos`,
+         allele_freq_T = `Allele Freq (T)`,
+         allele_freq_N = `Allele Freq (N)`,
+         variant_reads = `Variant Reads`,
+         ref_reads = `Ref Reads`,
+         variant_reads_Normal = `Variant Reads (Normal)`,
+         ref_reads_Normal = `Ref Reads (Normal)`,
+         n_mutation_in_sample = `# Mut in Sample`) %>% 
+  mutate(mutation_class = if_else(mutation_type == "Nonsense_Mutation",
+                                  "Nonsense",
+                                  mutation_type),
+         mutation_class = if_else(mutation_class == "Missense_Mutation",
+                                  "Missense",
+                                  mutation_class),
+         mutation_class = if_else(mutation_class %in% c("Frame_Shift_Del", "Frame_Shift_Ins"),
+                                  "Frame_Shift",
+                                  mutation_class),
+         mutation_class = if_else(!(mutation_class %in% c("Missense",  "Nonsense", "Frame_Shift")),
+                                  "Other",
+                                  mutation_class))
+
+######################################################################
+######################################################################
+
+setd2_location_mutation_tb <- setd2_patient_tb %>% 
+  filter(!(mutation_type == "fusion")) %>% 
+  tidyr::extract(mutation, c("start", "location", "stop"), gene_location_regex_string) %>% 
+  mutate(location = as.numeric(location))
+
+nsd2_location_mutation_tb <- nsd2_patient_tb %>% 
+  filter(!(mutation_type == "fusion")) %>% 
+  tidyr::extract(mutation, c("start", "location", "stop"), gene_location_regex_string) %>% 
+  mutate(location = as.numeric(location))
+
+pbrm1_location_mutation_tb <- pbrm1_patient_tb %>% 
+  filter(!(mutation_type == "fusion")) %>% 
+  tidyr::extract(mutation, c("start", "location", "stop"), gene_location_regex_string) %>% 
+  mutate(location = as.numeric(location))
+
+kmt2c_location_mutation_tb <- kmt2c_patient_tb %>% 
+  filter(!(mutation_type == "fusion")) %>% 
+  tidyr::extract(mutation, c("start", "location", "stop"), gene_location_regex_string) %>% 
+  mutate(location = as.numeric(location))
+
+arid1a_location_mutation_tb <- arid1a_patient_tb %>% 
+  filter(!(mutation_type == "fusion")) %>% 
+  tidyr::extract(mutation, c("start", "location", "stop"), gene_location_regex_string) %>% 
+  mutate(location = as.numeric(location))
+
+setd2_bins <- c(1000, 1400, 1800, 2300)
+binned_setd2_location_mutation_tb <- setd2_location_mutation_tb %>% 
+  rename(tumor_type = ttype) %>% 
+  mutate(gene_mutation = "SETD2",
+         location = as.numeric(location),
+         bin = 1,
+         bin = if_else(location >= setd2_bins[1],
+                       2,
+                       bin),
+         bin = if_else(location >= setd2_bins[2],
+                       3,
+                       bin),
+         bin = if_else(location >= setd2_bins[3],
+                       4,
+                       bin),
+         bin = if_else(location >= setd2_bins[4],
+                       5, 
+                       bin),
+         relative_location = location/2564)
+
+# nsd2_location_mutation_tb %>% pull(location) %>% as.numeric() %>% max()##[1] 1361
+nsd2_bins <- c(300, 600, 900, 1200)
+binned_nsd2_location_mutation_tb <- nsd2_location_mutation_tb %>% 
+  rename(tumor_type = ttype) %>% 
+  mutate(gene_mutation = "NSD2",
+         location = as.numeric(location),
+         bin = 1,
+         bin = if_else(location >= nsd2_bins[1],
+                       2,
+                       bin),
+         bin = if_else(location >= nsd2_bins[2],
+                       3,
+                       bin),
+         bin = if_else(location >= nsd2_bins[3],
+                       4,
+                       bin),
+         bin = if_else(location >= nsd2_bins[4],
+                       5, 
+                       bin),
+         relative_location = location/1365)
+
+# pbrm1_location_mutation_tb %>% pull(location) %>% as.numeric() %>% max()##[1] 1690
+pbrm1_bins <- c(400, 800, 1200, 1600)
+binned_pbrm1_location_mutation_tb <- pbrm1_location_mutation_tb %>% 
+  rename(tumor_type = ttype) %>% 
+  mutate(gene_mutation = "PBRM1",
+         location = as.numeric(location),
+         bin = 1,
+         bin = if_else(location >= pbrm1_bins[1],
+                       2,
+                       bin),
+         bin = if_else(location >= pbrm1_bins[2],
+                       3,
+                       bin),
+         bin = if_else(location >= pbrm1_bins[3],
+                       4,
+                       bin),
+         bin = if_else(location >= pbrm1_bins[4],
+                       5, 
+                       bin),
+         relative_location = location/1690)
+
+# kmt2c_location_mutation_tb %>% pull(location) %>% as.numeric() %>% max()##[1] 4912
+kmt2c_bins <- c(1000, 2000, 3000, 4000)
+binned_kmt2c_location_mutation_tb <- kmt2c_location_mutation_tb %>% 
+  rename(tumor_type = ttype) %>% 
+  mutate(gene_mutation = "KMT2C",
+         location = as.numeric(location),
+         bin = 1,
+         bin = if_else(location >= kmt2c_bins[1],
+                       2,
+                       bin),
+         bin = if_else(location >= kmt2c_bins[2],
+                       3,
+                       bin),
+         bin = if_else(location >= kmt2c_bins[3],
+                       4,
+                       bin),
+         bin = if_else(location >= kmt2c_bins[4],
+                       5, 
+                       bin),
+         relative_location = location/4912)
+
+# arid1a_location_mutation_tb %>% pull(location) %>% as.numeric() %>% max()##[1] 2276
+arid1a_bins <- c(500, 1000, 1500, 2000)
+binned_arid1a_location_mutation_tb <- arid1a_location_mutation_tb %>% 
+  rename(tumor_type = ttype) %>% 
+  mutate(gene_mutation = "ARID1A",
+         location = as.numeric(location),
+         bin = 1,
+         bin = if_else(location >= arid1a_bins[1],
+                       2,
+                       bin),
+         bin = if_else(location >= arid1a_bins[2],
+                       3,
+                       bin),
+         bin = if_else(location >= arid1a_bins[3],
+                       4,
+                       bin),
+         bin = if_else(location >= arid1a_bins[4],
+                       5, 
+                       bin),
+         relative_location = location/2285)
+
+binned_patient_location_tb <- bind_rows(binned_setd2_location_mutation_tb,
+                                        binned_nsd2_location_mutation_tb,
+                                        binned_pbrm1_location_mutation_tb,
+                                        binned_kmt2c_location_mutation_tb,
+                                        binned_arid1a_location_mutation_tb)
+
+######################################################################
+######################################################################
+
+classifier_tb <- binned_patient_location_tb %>%
+  mutate(vital_response = if_else(vital_status == "Alive",
+                                  "1",
+                                  "Unknown"),
+         vital_response = if_else(vital_status == "Dead",
+                                  "0",
+                                  vital_response)) %>%
+  select(Barcode_ID, vital_response, vital_status, 
+         death_days_to, tumor_type, age_at_diagnosis, gender, 
+         gene_mutation, mutation_class, 
+         start, location, relative_location, stop, 
+         allele_freq_T, ref_reads_Normal, n_mutation_in_sample) %>%
+  mutate(age_at_diagnosis = as.numeric(age_at_diagnosis),
+         log_death_days_to = log10(death_days_to),
+         log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample))
+
+
+######################################################################
+######################################################################
+
+
+model_tb <- binned_patient_location_tb %>%
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal)) %>%
+  select(Barcode_ID, tumor_type, gene_mutation, mutation_class, 
+         start, relative_location, stop, 
+         allele_freq_T, log_ref_reads_Normal)
+
+model_tb <- full_join(tcga_survival_tb, model_tb) %>% 
+  mutate(vital_response = if_else(vital_status == "Alive",
+                                  "1",
+                                  "NA"),
+         vital_response = if_else(vital_status == "Dead",
+                                  "0",
+                                  vital_response),
+         vital_response = as.numeric(vital_response),
+         tumor_response = if_else(tumor_status == "TUMOR FREE",
+                                  "1",
+                                  "NA"),
+         tumor_response = if_else(tumor_status == "WITH TUMOR",
+                                  "0",
+                                  tumor_response),
+         tumor_response = as.numeric(tumor_response),
+         gene_mutation = if_else(is.na(gene_mutation),
+                                 "complement",
+                                 gene_mutation),
+         mutation_class = if_else(is.na(mutation_class),
+                                  "Unkown",
+                                  mutation_class),
+         start = if_else(is.na(start),
+                         "Unkown",
+                         start),
+         stop = if_else(is.na(stop),
+                        "Unkown",
+                        stop))
+```
+
+# Data
+
+We have data tables from three main sources: cbioportal 
+(http://www.cbioportal.org/results/cancerTypesSummary?case_set_id=all&gene_list=SETD2&cancer_study_list=5c8a7d55e4b046111fee2296),
+tumorportal (http://www.tumorportal.org/view?geneSymbol=SETD2),
+and GDC (https://portal.gdc.cancer.gov/legacy-archive/search/f?filters=%7B%22op%22:%22and%22,%22content%22:%5B%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.data_category%22,%22value%22:%5B%22Clinical%22%5D%7D%7D,%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.data_format%22,%22value%22:%5B%22Biotab%22%5D%7D%7D%5D%7D).
+The GDC data table contains data on patients.
+
+For this report we consistently used dataframes from cBioPortal.
+Note that there were some available dataframes, such as protein expression and structural variants,
+which were `NA` for SETD2 gene mutations. So we are not including such
+extraneous data columns from cBioPortal.
+
+#### SETD2 Mutation Data
+
+```{r}
+setd2_patient_tb
+```
+
+#### NSD2 Mutation Data
+
+```{r}
+nsd2_patient_tb
+```
+
+#### PBRM1 Mutation Data
+
+```{r}
+pbrm1_patient_tb
+```
+
+#### KMT2C Mutation Data
+
+```{r}
+kmt2c_patient_tb
+```
+
+#### ARID1A Mutation Data
+
+```{r}
+arid1a_patient_tb
+```
+
+
+# Exploratory Data Analysis
+
+We are primarily interested in determining mutations that 
+are associated with patient outcomes across tumor types.
+Some gene mutations have a simple "start", "location",
+and "stop" pattern. However, other mutations such as "AMP",
+"HOMDEL", and "FUSION" do not have this pattern.
+So we group by certain mutation types and 
+focus on gene mutations with a "start", "location", "stop"
+for the protein change column in cBioPortal.
+
+The "mutation classes" are missense, nonsense, 
+frame shift, and other. In this context the frame shift
+class contains "Frame_Shift_Del" and "Frame_Shift_Ins".
+The other class contains rare mutation types such as 
+"Splice_Site", "Splice_Region", "fusion", and "In_Frame_Del".
+
+```{r}
+setd2_patient_tb %>% 
+  count(mutation_class, ttype, vital_status) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(mutation_class, log10(n), fill = vital_status)) + 
+  geom_col(alpha = .75) + 
+  facet_wrap( ~ ttype) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("SETD2 Mutation Variant Types",
+          subtitle = "complement means no tumor type data for these patients with this mutation in cBioPortal")
+
+nsd2_patient_tb %>% 
+  count(mutation_class, ttype, vital_status) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(mutation_class, log10(n), fill = vital_status)) + 
+  geom_col(alpha = .75) + 
+  facet_wrap( ~ ttype) +
+  theme(axis.text.x = element_text(angle = 90)) + 
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("NSD2 Mutation Variant Types",
+          subtitle = "complement means no tumor type data for these patients with this mutation in cBioPortal")
+
+pbrm1_patient_tb %>% 
+  count(mutation_class, ttype, vital_status) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(mutation_class, log10(n), fill = vital_status)) + 
+  geom_col(alpha = .75) + 
+  facet_wrap( ~ ttype) +
+  theme(axis.text.x = element_text(angle = 90)) + 
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("PBRM1 Mutation Variant Types",
+          subtitle = "complement means no tumor type data for these patients with this mutation in cBioPortal")
+
+kmt2c_patient_tb %>% 
+  count(mutation_class, ttype, vital_status) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(mutation_class, log10(n), fill = vital_status)) + 
+  geom_col(alpha = .75) + 
+  facet_wrap( ~ ttype) +
+  theme(axis.text.x = element_text(angle = 90)) + 
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("KMT2C Mutation Variant Types",
+          subtitle = "complement means no tumor type data for these patients with this mutation in cBioPortal")
+
+arid1a_patient_tb %>% 
+  count(mutation_class, ttype, vital_status) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(mutation_class, log10(n), fill = vital_status)) + 
+  geom_col(alpha = .75) + 
+  facet_wrap( ~ ttype) +
+  theme(axis.text.x = element_text(angle = 90)) + 
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("ARID1A Mutation Variant Types",
+          subtitle = "complement means no tumor type data for these patients with this mutation in cBioPortal")
+```
+
+
+# EDA 
+
+<!-- ```{r} -->
+<!-- model_tb %>%  -->
+<!--   filter(gene_mutation != "complement") %>%  -->
+<!--   select(vital_response, tumor_type, gene_mutation, mutation_class) %>%  -->
+<!--   ggpairs(mapping = ggplot2::aes(color = vital_response), -->
+<!--           lower = list(continuous = wrap("points", alpha = .3, size = 1)), -->
+<!--           diag = list(continuous = wrap("densityDiag", alpha = .3)), -->
+<!--           upper = list(continuous = wrap("cor", size = 4, align_percent = .5))) -->
+<!-- ``` -->
+
+
+```{r}
+model_tb %>% 
+  filter(!is.na(death_days_to), gene_mutation != "complement") %>% 
+  select(death_days_to, tumor_type, gene_mutation, mutation_class) %>% 
+  mutate(death_days_to = log10(death_days_to)) %>% 
+  ggpairs(lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 4, align_percent = .5)))
+```
+
+<!-- # Classifier for Vital Status -->
+
+<!-- Let us try to fit  a classifier to this data -->
+<!-- to predict vital status. Below are simple  -->
+<!-- EDA plots of each feature in this classifier -->
+<!-- except for "start", "location", and "stop". -->
+<!-- Note that some of the features need to be log-transformed. -->
+
+<!-- ## SETD2 metadata -->
+
+<!-- ```{r} -->
+<!-- classifier_tb %>%  -->
+<!--   filter(gene_mutation == "SETD2", mutation_class != "Other") %>%  -->
+<!--   ggplot(aes(age_at_diagnosis, fill = vital_status)) + -->
+<!--   geom_histogram() +  -->
+<!--   scale_fill_manual(values = c("blue", "red")) -->
+
+<!-- classifier_tb %>%  -->
+<!--   filter(gene_mutation == "SETD2", mutation_class != "Other") %>%  -->
+<!--   filter(vital_status == "Dead") %>% -->
+<!--   ggplot(aes(log10(death_days_to), fill = vital_status)) + -->
+<!--   geom_histogram() +  -->
+<!--   scale_fill_manual(values = c("red")) -->
+
+<!-- classifier_tb %>%  -->
+<!--   filter(gene_mutation == "SETD2", mutation_class != "Other") %>%  -->
+<!--   ggplot(aes(gender, fill = vital_status)) + -->
+<!--   geom_bar() +  -->
+<!--   scale_fill_manual(values = c("blue", "red")) -->
+
+<!-- classifier_tb %>%  -->
+<!--   filter(gene_mutation == "SETD2", mutation_class != "Other") %>%   -->
+<!--   ggplot(aes(allele_freq_T, fill = vital_status)) + -->
+<!--   geom_bar() +  -->
+<!--   scale_fill_manual(values = c("blue", "red")) -->
+
+<!-- classifier_tb %>%  -->
+<!--   filter(gene_mutation == "SETD2", mutation_class != "Other") %>%  -->
+<!--   ggplot(aes(log10(ref_reads_Normal), fill = vital_status)) + -->
+<!--   geom_histogram() +  -->
+<!--   scale_fill_manual(values = c("blue", "red")) -->
+
+<!-- classifier_tb %>%  -->
+<!--   filter(gene_mutation == "SETD2", mutation_class != "Other") %>%  -->
+<!--   ggplot(aes(log10(n_mutation_in_sample), fill = vital_status)) + -->
+<!--   geom_histogram() +  -->
+<!--   scale_fill_manual(values = c("blue", "red")) -->
+<!-- ``` -->
+
+<!-- #### Naive logistic regression -->
+
+<!-- Note that logistic regression is not doing well -->
+<!-- for this classification problem. -->
+
+<!-- ###### Using many predictors -->
+
+<!-- ```{r} -->
+<!-- set.seed(1234) -->
+<!-- logit_out <- glm(vital_response ~ gene_mutation + age_at_diagnosis + gender + tumor_type + mutation_class + relative_location + allele_freq_T + log_ref_reads_Normal, -->
+<!--                          data = classifier_tb, family = "binomial") -->
+<!-- summary(logit_out) -->
+<!-- ``` -->
+
+<!-- ###### Using gene mutation predictors -->
+
+<!-- ```{r} -->
+<!-- set.seed(14) -->
+<!-- gene_logit_out <- glm(vital_response ~ gene_mutation + mutation_class + relative_location + allele_freq_T + log_ref_reads_Normal, -->
+<!--                          data = classifier_tb, family = "binomial") -->
+<!-- summary(gene_logit_out) -->
+<!-- ``` -->
+
+# Random Forests
+
+At first we used bagged decision trees, because the only predictor in
+our classifier was the mutation location value. We are now including as many
+predictors as possible from our data. With many predictors, the model switches
+from a bagged decision tree to a random forest. In both models, the main difference 
+with regular decision trees is an explicit attempt during the model fitting to prevent
+over fitting observed data.
+
+#### Vital Status
+
+###### All gene mutations
+
+```{r, echo = TRUE}
+set.seed(3)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), mutation_class != "Other", !is.na(age_at_diagnosis)) %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ age_at_diagnosis + gender + tumor_type + gene_mutation + mutation_class + start + relative_location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]),
+                        importance = TRUE)
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Median cross-validated error is %f",
+              median(tree_error_vec)))
+```
+
+###### All gene mutations, but not all metadata
+
+We see that age at diagnosis is a helpful predictor of vital status.
+
+```{r, echo = TRUE}
+set.seed(1234)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), mutation_class != "Other") %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ gender + tumor_type + gene_mutation + mutation_class + start + relative_location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]))
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Median cross-validated error is %f",
+              median(tree_error_vec)))
+```
+
+###### SETD2 mutations
+
+```{r, echo = TRUE}
+set.seed(14)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), gene_mutation == "SETD2", mutation_class != "Other", !is.na(age_at_diagnosis)) %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+random_forest_output_ls <- rep(list(NULL), length(tree_error_vec))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ mutation_class + location + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]))
+  
+  random_forest_output_ls[[i]] <- model
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Median cross-validated error using only SETD2 is %f",
+              median(tree_error_vec)))
+```
+
+```{r}
+random_forest_output_ls[[1]]$importance
+
+varImpPlot(random_forest_output_ls[[1]])
+plot(random_forest_output_ls[[1]])
+```
+
+```{r, echo = TRUE}
+set.seed(14)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), gene_mutation %in% c("SETD2", "NSD2"), mutation_class != "Other", !is.na(age_at_diagnosis)) %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ age_at_diagnosis + gender + tumor_type + mutation_class + start + relative_location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]))
+  
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Median cross-validated error using SETD2 and NSD2 is %f",
+              median(tree_error_vec)))
+```
+
+
+###### NSD2 mutations
+
+```{r, echo = TRUE}
+set.seed(4)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), gene_mutation == "NSD2", mutation_class != "Other", !is.na(age_at_diagnosis)) %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ age_at_diagnosis + gender + tumor_type + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]))
+  
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Mean cross-validated error using only NSD2 is %f",
+              mean(tree_error_vec)))
+```
+
+###### PBRM1 mutations
+
+```{r, echo = TRUE}
+set.seed(146)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), gene_mutation == "PBRM1", mutation_class != "Other", !is.na(age_at_diagnosis)) %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ age_at_diagnosis + gender + tumor_type + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]))
+  
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Median cross-validated error using only PBRM1 is %f",
+              median(tree_error_vec)))
+```
+
+###### KMT2C mutations
+
+```{r, echo = TRUE}
+set.seed(178)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), gene_mutation == "KMT2C", mutation_class != "Other", !is.na(age_at_diagnosis)) %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ age_at_diagnosis + gender + tumor_type + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]))
+  
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Median cross-validated error using only KMT2C is %f",
+              median(tree_error_vec)))
+```
+
+###### ARID1A mutations
+
+```{r, echo = TRUE}
+set.seed(14)
+dummy_df <- classifier_tb %>% 
+  filter(vital_response %in% c("0", "1"), gene_mutation == "ARID1A", mutation_class != "Other", !is.na(age_at_diagnosis)) %>%
+  mutate(vital_response = parse_factor(vital_response,
+                                       levels = c("0","1")))
+cv_df_ls <- generate_cv_df_ls(df = dummy_df,
+                              fold = 10, pad = -2:2)
+
+tree_error_vec <- rep(NA, length(cv_df_ls))
+for (i in seq_along(cv_df_ls)) {
+  model <- randomForest(vital_response ~ age_at_diagnosis + gender + tumor_type + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = bind_rows(cv_df_ls[-i]))
+  
+  tree_error_vec[i] <- attr(confusion(predict(model, cv_df_ls[[i]]), cv_df_ls[[i]]$vital_response), "error")
+}
+```
+
+```{r}
+print(sprintf("Median cross-validated error using only ARID1A is %f",
+              median(tree_error_vec)))
+```
+
+
+#### Tumor Type
+
+###### All gene mutations
+
+```{r, echo = TRUE}
+set.seed(38)
+dummy_df <- classifier_tb %>% 
+  filter(tumor_type != "complement", mutation_class != "Other", !is.na(gender), !is.na(allele_freq_T), !is.na(log_ref_reads_Normal)) %>% 
+  mutate(tumor_type = parse_factor(as.character(tumor_type),
+                                   levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA")))
+sample_rows <- sample(nrow(dummy_df), .3*nrow(dummy_df))
+
+train_df <- dummy_df[-sample_rows, ]
+test_df <- dummy_df[sample_rows, ]
+
+tumor_model <- randomForest(tumor_type ~ gender + gene_mutation + mutation_class + start + relative_location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = train_df)
+  
+attr(confusion(predict(tumor_model, test_df), test_df$tumor_type), "error")
+
+```
+
+###### SETD2
+
+```{r, echo = TRUE}
+set.seed(39)
+dummy_df <- classifier_tb %>% 
+  filter(tumor_type != "complement", gene_mutation == "SETD2", !is.na(gender), mutation_class != "Other", !is.na(allele_freq_T), !is.na(log_ref_reads_Normal)) %>% 
+  mutate(tumor_type = parse_factor(as.character(tumor_type),
+                                   levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA")))
+sample_rows <- sample(nrow(dummy_df), .3*nrow(dummy_df))
+
+train_df <- dummy_df[-sample_rows, ]
+test_df <- dummy_df[sample_rows, ]
+
+tumor_model <- randomForest(tumor_type ~ gender + gene_mutation + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = train_df)
+  
+attr(confusion(predict(tumor_model, test_df), test_df$tumor_type), "error")
+
+```
+
+###### NSD2
+
+```{r, echo = TRUE}
+set.seed(39)
+dummy_df <- classifier_tb %>% 
+  filter(tumor_type != "complement", gene_mutation == "NSD2", !is.na(gender), mutation_class != "Other", !is.na(allele_freq_T), !is.na(log_ref_reads_Normal)) %>% 
+  mutate(tumor_type = parse_factor(as.character(tumor_type),
+                                   levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA")))
+sample_rows <- sample(nrow(dummy_df), .3*nrow(dummy_df))
+
+train_df <- dummy_df[-sample_rows, ]
+test_df <- dummy_df[sample_rows, ]
+
+tumor_model <- randomForest(tumor_type ~ gender + gene_mutation + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = train_df)
+  
+attr(confusion(predict(tumor_model, test_df), test_df$tumor_type), "error")
+
+```
+
+###### PBRM1
+
+```{r, echo = TRUE}
+set.seed(39)
+dummy_df <- classifier_tb %>% 
+  filter(tumor_type != "complement", gene_mutation == "PBRM1", !is.na(gender), mutation_class != "Other", !is.na(allele_freq_T), !is.na(log_ref_reads_Normal)) %>% 
+  mutate(tumor_type = parse_factor(as.character(tumor_type),
+                                   levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA")))
+sample_rows <- sample(nrow(dummy_df), .3*nrow(dummy_df))
+
+train_df <- dummy_df[-sample_rows, ]
+test_df <- dummy_df[sample_rows, ]
+
+tumor_model <- randomForest(tumor_type ~ gender + gene_mutation + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = train_df)
+  
+attr(confusion(predict(tumor_model, test_df), test_df$tumor_type), "error")
+
+```
+
+###### KMT2C
+
+```{r, echo = TRUE}
+set.seed(39)
+dummy_df <- classifier_tb %>% 
+  filter(tumor_type != "complement", gene_mutation == "KMT2C", !is.na(gender), mutation_class != "Other", !is.na(allele_freq_T), !is.na(log_ref_reads_Normal)) %>% 
+  mutate(tumor_type = parse_factor(as.character(tumor_type),
+                                   levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA")))
+sample_rows <- sample(nrow(dummy_df), .3*nrow(dummy_df))
+
+train_df <- dummy_df[-sample_rows, ]
+test_df <- dummy_df[sample_rows, ]
+
+tumor_model <- randomForest(tumor_type ~ gender + gene_mutation + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = train_df)
+  
+attr(confusion(predict(tumor_model, test_df), test_df$tumor_type), "error")
+
+```
+
+###### ARID1A
+
+```{r, echo = TRUE}
+set.seed(39)
+dummy_df <- classifier_tb %>% 
+  filter(tumor_type != "complement", gene_mutation == "ARID1A", !is.na(gender), mutation_class != "Other", !is.na(allele_freq_T), !is.na(log_ref_reads_Normal)) %>% 
+  mutate(tumor_type = parse_factor(as.character(tumor_type),
+                                   levels = c("KIRC", "UCEC", "LUAD", "BRCA", "HNSC", "BLCA")))
+sample_rows <- sample(nrow(dummy_df), .3*nrow(dummy_df))
+
+train_df <- dummy_df[-sample_rows, ]
+test_df <- dummy_df[sample_rows, ]
+
+tumor_model <- randomForest(tumor_type ~ gender + gene_mutation + mutation_class + start + location + stop + allele_freq_T + log_ref_reads_Normal,
+                        data = train_df)
+  
+attr(confusion(predict(tumor_model, test_df), test_df$tumor_type), "error")
+
+```
+
+## Classifier Discussion
+
+We see that a random forest does very well, even when we do not have that much
+synthetic data added. We need to do more analysis on the model to see which predictors 
+are strong predictors in the underlying decision trees.
+
+# Mutation 'Location' EDA
+
+First we will look into the "location" of the different
+mutations without considering the different tumor types.
+Next we will split the data by tumor type. Finally,
+we will use the bins as a final exploratory step. 
+Note that different gene mutations have different ranges for
+the "location" parameter.
+
+We can count the different "start" and "stop"
+factors. For now we will focus on the "location" factor. 
+Based on a previous meeting, we will bin
+the location into nonequal regions based on domain expertise of SETD2.
+Bin 1 is for "location" [0, 1000),
+bin 2 is for "location" [1000, 1400),
+bin 3 is for "location" [1400, 1800),
+bin 4 is for "location" [1800, 2300),
+and bin 5 is for "location" [2300, infinity). For the
+non-SETD2 mutations we will bin based on equally
+spaced 
+
+```{r, fig.show="hold", out.width="50%"}
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "SETD2") %>% 
+  ggplot(aes(location)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 fill = "blue",
+                 alpha = .75,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               fill = "blue",
+               alpha = .5) + 
+  geom_vline(xintercept = setd2_bins[1]) +
+  geom_vline(xintercept = setd2_bins[2]) +
+  geom_vline(xintercept = setd2_bins[3]) +
+  geom_vline(xintercept = setd2_bins[4]) +
+  xlab("SETD2 mutation location") + 
+  ggtitle("Histogram of SETD2 mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "NSD2") %>% 
+  ggplot(aes(location)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 fill = "blue",
+                 alpha = .75,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               fill = "blue",
+               alpha = .5) + 
+  geom_vline(xintercept = nsd2_bins[1]) +
+  geom_vline(xintercept = nsd2_bins[2]) +
+  geom_vline(xintercept = nsd2_bins[3]) +
+  geom_vline(xintercept = nsd2_bins[4]) +
+  xlab("NSD2 mutation location") + 
+  ggtitle("Histogram of NSD2 mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "PBRM1") %>% 
+  ggplot(aes(location)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 fill = "blue",
+                 alpha = .75,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               fill = "blue",
+               alpha = .5) + 
+  geom_vline(xintercept = pbrm1_bins[1]) +
+  geom_vline(xintercept = pbrm1_bins[2]) +
+  geom_vline(xintercept = pbrm1_bins[3]) +
+  geom_vline(xintercept = pbrm1_bins[4]) +
+  xlab("PBRM1 mutation location") + 
+  ggtitle("Histogram of PBRM1 mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "KMT2C") %>% 
+  ggplot(aes(location)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 fill = "blue",
+                 alpha = .75,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               fill = "blue",
+               alpha = .5) + 
+  geom_vline(xintercept = kmt2c_bins[1]) +
+  geom_vline(xintercept = kmt2c_bins[2]) +
+  geom_vline(xintercept = kmt2c_bins[3]) +
+  geom_vline(xintercept = kmt2c_bins[4]) +
+  xlab("KMT2C mutation location") + 
+  ggtitle("Histogram of KMT2C mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "ARID1A") %>% 
+  ggplot(aes(location)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 fill = "blue",
+                 alpha = .75,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               fill = "blue",
+               alpha = .5) + 
+  geom_vline(xintercept = arid1a_bins[1]) +
+  geom_vline(xintercept = arid1a_bins[2]) +
+  geom_vline(xintercept = arid1a_bins[3]) +
+  geom_vline(xintercept = arid1a_bins[4]) +
+  xlab("ARID1A mutation location") + 
+  ggtitle("Histogram of ARID1A mutations by location")
+```
+
+```{r, fig.show="hold", out.width="50%"}
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "SETD2") %>% 
+  add_count(mutation_class) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(location, color = vital_status, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .3,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  facet_wrap(vital_status ~ mutation_class, 
+             scales = "free_y", labeller = "label_both") +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = setd2_bins[1]) +
+  geom_vline(xintercept = setd2_bins[2]) +
+  geom_vline(xintercept = setd2_bins[3]) +
+  geom_vline(xintercept = setd2_bins[4]) +
+  xlab("SETD2 mutation location") + 
+  scale_color_manual(values = c("blue", "black", "red")) +
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("Histogram of SETD2 mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "NSD2") %>% 
+  add_count(mutation_class) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(location, color = vital_status, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .3,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  facet_wrap(vital_status ~ mutation_class, 
+             scales = "free_y", labeller = "label_both") +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = nsd2_bins[1]) +
+  geom_vline(xintercept = nsd2_bins[2]) +
+  geom_vline(xintercept = nsd2_bins[3]) +
+  geom_vline(xintercept = nsd2_bins[4]) +
+  xlab("NSD2 mutation location") + 
+  scale_color_manual(values = c("blue", "black", "red")) +
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("Histogram of NSD2 mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "PBRM1") %>% 
+  add_count(mutation_class) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(location, color = vital_status, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .3,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  facet_wrap(vital_status ~ mutation_class, 
+             scales = "free_y", labeller = "label_both") +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = pbrm1_bins[1]) +
+  geom_vline(xintercept = pbrm1_bins[2]) +
+  geom_vline(xintercept = pbrm1_bins[3]) +
+  geom_vline(xintercept = pbrm1_bins[4]) +
+  xlab("PBRM1 mutation location") + 
+  scale_color_manual(values = c("blue", "black", "red")) +
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("Histogram of PBRM1 mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "KMT2C") %>% 
+  add_count(mutation_class) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(location, color = vital_status, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .3,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  scale_color_manual(values = c("blue", "black", "red")) +
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  facet_wrap(vital_status ~ mutation_class, 
+             scales = "free_y", labeller = "label_both") +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = kmt2c_bins[1]) +
+  geom_vline(xintercept = kmt2c_bins[2]) +
+  geom_vline(xintercept = kmt2c_bins[3]) +
+  geom_vline(xintercept = kmt2c_bins[4]) +
+  xlab("KMT2C mutation location") + 
+  ggtitle("Histogram of KMT2C mutations by location")
+
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "ARID1A") %>% 
+  add_count(mutation_class) %>% 
+  mutate(mutation_class = fct_reorder(mutation_class, -n)) %>% 
+  ggplot(aes(location, color = vital_status, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .3,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  facet_wrap(vital_status ~ mutation_class, 
+             scales = "free_y", labeller = "label_both") +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = arid1a_bins[1]) +
+  geom_vline(xintercept = arid1a_bins[2]) +
+  geom_vline(xintercept = arid1a_bins[3]) +
+  geom_vline(xintercept = arid1a_bins[4]) +
+  xlab("ARID1A mutation location") + 
+  scale_color_manual(values = c("blue", "black", "red")) +
+  scale_fill_manual(values = c("blue", "black", "red")) +
+  ggtitle("Histogram of ARID1A mutations by location")
+```
+
+#### SETD2 Mutation Location and Patient Vital Status
+
+###### Missense Class 
+
+```{r}
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "SETD2", mutation_class == "Missense") %>% 
+  ggplot(aes(location, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = setd2_bins[1]) +
+  geom_vline(xintercept = setd2_bins[2]) +
+  geom_vline(xintercept = setd2_bins[3]) +
+  geom_vline(xintercept = setd2_bins[4]) +
+  xlab("SETD2 mutation location") + 
+  ggtitle("Histogram of SETD2 mutations by location") + 
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Nonsense Class
+
+```{r}
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "SETD2", mutation_class == "Nonsense") %>% 
+  ggplot(aes(location, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = setd2_bins[1]) +
+  geom_vline(xintercept = setd2_bins[2]) +
+  geom_vline(xintercept = setd2_bins[3]) +
+  geom_vline(xintercept = setd2_bins[4]) +
+  xlab("SETD2 mutation location") + 
+  ggtitle("Histogram of SETD2 mutations by location") + 
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Frame Shift Class
+
+```{r}
+binned_patient_location_tb %>% 
+  filter(gene_mutation == "SETD2", mutation_class == "Frame_Shift") %>% 
+  ggplot(aes(location, fill = vital_status)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) + 
+  geom_density(aes(y = ..density..),
+               alpha = .3) + 
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = setd2_bins[1]) +
+  geom_vline(xintercept = setd2_bins[2]) +
+  geom_vline(xintercept = setd2_bins[3]) +
+  geom_vline(xintercept = setd2_bins[4]) +
+  xlab("SETD2 mutation location") + 
+  ggtitle("Histogram of SETD2 mutations by location") + 
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+#### NSD2 Mutation Location and Patient Vital Status
+
+###### Missense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "NSD2", mutation_class == "Missense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = nsd2_bins[1]) +
+  geom_vline(xintercept = nsd2_bins[2]) +
+  geom_vline(xintercept = nsd2_bins[3]) +
+  geom_vline(xintercept = nsd2_bins[4]) +
+  xlab("NSD2 mutation location") +
+  ggtitle("Histogram of NSD2 mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Nonsense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "NSD2", mutation_class == "Nonsense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = nsd2_bins[1]) +
+  geom_vline(xintercept = nsd2_bins[2]) +
+  geom_vline(xintercept = nsd2_bins[3]) +
+  geom_vline(xintercept = nsd2_bins[4]) +
+  xlab("NSD2 mutation location") +
+  ggtitle("Histogram of NSD2 mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Frame Shift Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "NSD2", mutation_class == "Frame_Shift") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = nsd2_bins[1]) +
+  geom_vline(xintercept = nsd2_bins[2]) +
+  geom_vline(xintercept = nsd2_bins[3]) +
+  geom_vline(xintercept = nsd2_bins[4]) +
+  xlab("NSD2 mutation location") +
+  ggtitle("Histogram of NSD2 mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+
+#### PBRM1 Mutation Location and Patient Vital Status
+
+###### Missense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "PBRM1", mutation_class == "Missense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = pbrm1_bins[1]) +
+  geom_vline(xintercept = pbrm1_bins[2]) +
+  geom_vline(xintercept = pbrm1_bins[3]) +
+  geom_vline(xintercept = pbrm1_bins[4]) +
+  xlab("PBRM1 mutation location") +
+  ggtitle("Histogram of PBRM1 mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Nonsense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "PBRM1", mutation_class == "Nonsense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = pbrm1_bins[1]) +
+  geom_vline(xintercept = pbrm1_bins[2]) +
+  geom_vline(xintercept = pbrm1_bins[3]) +
+  geom_vline(xintercept = pbrm1_bins[4]) +
+  xlab("PBRM1 mutation location") +
+  ggtitle("Histogram of PBRM1 mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Frame Shift
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "PBRM1", mutation_class == "Frame_Shift") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = pbrm1_bins[1]) +
+  geom_vline(xintercept = pbrm1_bins[2]) +
+  geom_vline(xintercept = pbrm1_bins[3]) +
+  geom_vline(xintercept = pbrm1_bins[4]) +
+  xlab("PBRM1 mutation location") +
+  ggtitle("Histogram of PBRM1 mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+#### KMT2C Mutation Location and Patient Vital Status
+
+###### Missense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "KMT2C", mutation_class == "Missense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = kmt2c_bins[1]) +
+  geom_vline(xintercept = kmt2c_bins[2]) +
+  geom_vline(xintercept = kmt2c_bins[3]) +
+  geom_vline(xintercept = kmt2c_bins[4]) +
+  xlab("KMT2C mutation location") +
+  ggtitle("Histogram of KMT2C mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Nonsense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "KMT2C", mutation_class == "Nonsense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = kmt2c_bins[1]) +
+  geom_vline(xintercept = kmt2c_bins[2]) +
+  geom_vline(xintercept = kmt2c_bins[3]) +
+  geom_vline(xintercept = kmt2c_bins[4]) +
+  xlab("KMT2C mutation location") +
+  ggtitle("Histogram of KMT2C mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Frame Shift Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "KMT2C", mutation_class == "Frame_Shift") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = kmt2c_bins[1]) +
+  geom_vline(xintercept = kmt2c_bins[2]) +
+  geom_vline(xintercept = kmt2c_bins[3]) +
+  geom_vline(xintercept = kmt2c_bins[4]) +
+  xlab("KMT2C mutation location") +
+  ggtitle("Histogram of KMT2C mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+
+#### ARID1A Mutation Location and Patient Vital Status
+
+###### Missense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "ARID1A", mutation_class == "Missense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = arid1a_bins[1]) +
+  geom_vline(xintercept = arid1a_bins[2]) +
+  geom_vline(xintercept = arid1a_bins[3]) +
+  geom_vline(xintercept = arid1a_bins[4]) +
+  xlab("ARID1A mutation location") +
+  ggtitle("Histogram of ARID1A mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Nonsense Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "ARID1A", mutation_class == "Nonsense") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = arid1a_bins[1]) +
+  geom_vline(xintercept = arid1a_bins[2]) +
+  geom_vline(xintercept = arid1a_bins[3]) +
+  geom_vline(xintercept = arid1a_bins[4]) +
+  xlab("ARID1A mutation location") +
+  ggtitle("Histogram of ARID1A mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+###### Frame Shift Class
+
+```{r}
+binned_patient_location_tb %>%
+  filter(gene_mutation == "ARID1A", mutation_class == "Frame_Shift") %>%
+  ggplot(aes(location, fill = vital_status)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = .5,
+                 bins = 20) +
+  geom_density(aes(y = ..density..),
+               alpha = .3) +
+  facet_wrap( ~ tumor_type, scales = "free_y") +
+  geom_vline(xintercept = arid1a_bins[1]) +
+  geom_vline(xintercept = arid1a_bins[2]) +
+  geom_vline(xintercept = arid1a_bins[3]) +
+  geom_vline(xintercept = arid1a_bins[4]) +
+  xlab("ARID1A mutation location") +
+  ggtitle("Histogram of ARID1A mutations by location") +
+  scale_fill_manual(values = c("blue", "black", "red")) + 
+  theme(legend.position = "none")
+```
+
+
+## EDA of Allele Frequency, Mutation Load, and Location
+
+The "Allele Frequency" and "Mutation Load" refer
+to `Allele Frequency (T)` and `# Mut in Sample` columns
+from the cBioportal data frame. These features might be
+helpful in a classification model later on in this document.
+So let us do some basic EDA on these two features here.
+
+
+```{r}
+setd2_location_mutation_tb %>% 
+  filter(mutation_class == "Missense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 4, align_percent = .5))) +
+  ggtitle("SETD2 Missense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+setd2_location_mutation_tb %>% 
+  filter(mutation_class == "Nonsense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 4, align_percent = .5))) +
+  ggtitle("SETD2 Nonsense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+setd2_location_mutation_tb %>% 
+  filter(mutation_class == "Frame_Shift") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 4, align_percent = .5))) +
+  ggtitle("SETD2 Frame shift data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+```
+
+```{r}
+nsd2_location_mutation_tb %>% 
+  filter(mutation_class == "Missense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 4, align_percent = .5))) +
+  ggtitle("NSD2 Missense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+nsd2_location_mutation_tb %>% 
+  filter(mutation_class == "Frame_Shift") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 4, align_percent = .5))) +
+  ggtitle("NSD2 Frame shift data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+```
+
+```{r}
+pbrm1_location_mutation_tb %>% 
+  filter(mutation_class == "Missense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("PBRM1 Missense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+pbrm1_location_mutation_tb %>% 
+  filter(mutation_class == "Nonsense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("PBRM1 Nonsense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+pbrm1_location_mutation_tb %>% 
+  filter(mutation_class == "Frame_Shift") %>% 
+mutate(log_ref_reads_Normal = log10(ref_reads_Normal)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("PBRM1 Frame shift data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+```
+
+```{r}
+kmt2c_location_mutation_tb %>% 
+  filter(mutation_class == "Missense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("KMT2C Missense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+kmt2c_location_mutation_tb %>% 
+  filter(mutation_class == "Nonsense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("KMT2C Nonsense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+kmt2c_location_mutation_tb %>% 
+  filter(mutation_class == "Frame_Shift") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("KMT2C Frame shift data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+```
+
+```{r}
+arid1a_location_mutation_tb %>% 
+  filter(mutation_class == "Missense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>%  
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("ARID1A Missense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+arid1a_location_mutation_tb %>% 
+  filter(mutation_class == "Nonsense") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("ARID1A Nonsense data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+
+arid1a_location_mutation_tb %>% 
+  filter(mutation_class == "Frame_Shift") %>% 
+  mutate(log_ref_reads_Normal = log10(ref_reads_Normal),
+         log_n_mutation_in_sample = log10(n_mutation_in_sample)) %>% 
+  select(vital_status, location, 
+         allele_freq_T, log_ref_reads_Normal, log_n_mutation_in_sample) %>% 
+  ggpairs(mapping = ggplot2::aes(color = vital_status),
+          lower = list(continuous = wrap("points", alpha = .3, size = 1)),
+          diag = list(continuous = wrap("densityDiag", alpha = .3)),
+          upper = list(continuous = wrap("cor", size = 5, align_percent = .5))) +
+  ggtitle("ARID1A Frame shift data") +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  scale_fill_manual(values=c("blue", "black", "red"))
+```
+
+#### SETD2 Start and Stop Values
+
+```{r}
+setd2_location_mutation_tb %>% 
+  count(start) %>% 
+  arrange(desc(n))
+
+setd2_location_mutation_tb %>% 
+  count(stop) %>% 
+  arrange(desc(n))
+```
+
+<!-- ```{r} -->
+<!-- for_abid_strahl_df <- setd2_location_mutation_tb %>%  -->
+<!--   filter(location <= 1300, mutation_type == "Missense_Mutation") %>%  -->
+<!--   select(Barcode_ID, ttype, vital_status, start, location, stop) %>%  -->
+<!--   arrange(location) -->
+
+<!-- write_csv(for_abid_strahl_df, -->
+<!--           file = here("data", "SETD2_data_location_1_to_1300.csv")) -->
+<!-- ``` -->
+
+
+#### NSD2 Start and Stop Values
+
+```{r}
+nsd2_location_mutation_tb %>% 
+  count(start) %>% 
+  arrange(desc(n))
+
+nsd2_location_mutation_tb %>% 
+  count(stop) %>% 
+  arrange(desc(n))
+```
+
+#### PBRM1 Start and Stop Values
+
+```{r}
+pbrm1_location_mutation_tb %>% 
+  count(start) %>% 
+  arrange(desc(n))
+
+pbrm1_location_mutation_tb %>% 
+  count(stop) %>% 
+  arrange(desc(n))
+```
+
+#### KMT2C Start and Stop Values
+
+```{r}
+kmt2c_location_mutation_tb %>% 
+  count(start) %>% 
+  arrange(desc(n))
+
+kmt2c_location_mutation_tb %>% 
+  count(stop) %>% 
+  arrange(desc(n))
+```
+
+#### ARID1A Start and Stop Values
+
+```{r}
+arid1a_location_mutation_tb %>% 
+  count(start) %>% 
+  arrange(desc(n))
+
+arid1a_location_mutation_tb %>% 
+  count(stop) %>% 
+  arrange(desc(n))
+```
+
+
+
+
+
+
+
+

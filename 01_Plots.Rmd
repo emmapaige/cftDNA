@@ -1,0 +1,83 @@
+---
+title: "01_Plots"
+author: "Emma Mitchell"
+date: "2023-02-28"
+output: html_document
+---
+```{r}
+source('/Desktop/Research/ 01_functions.r')
+```
+
+```{r}
+set.seed(42)
+
+library(here)
+library(R.utils)
+library(tidyverse)
+library(tidytext)
+library(readxl)
+
+library(dgof)
+library(glmnet)
+library(survival)
+library(survminer)
+# library(UpSetR)
+
+library(grid)
+library(gridExtra)
+library(reshape2)
+
+```
+
+#load data
+
+We start with 368 unique customers and filter out customer based on Federico's data cleaning. 2 customers removed based on PFS_time (declared outliers by Federico and Corbin during EDA), 66 customers have NA for PFS_time. We end with 295, so some of the customers from Federico's list are already not in the excel data
+```{r}
+
+full_data <- read_xlsx(here("20190118_GNE01_Cumulative_Results_Report_annotated.xlsx")) %>% 
+  separate(Customer.SampleId, 
+           c("customer", "sampleId"), 
+           sep = "-", 
+           remove = FALSE,
+           extra = "merge") %>% 
+  filter(!(customer %in% c("SAAWZH", "SAAEFC", "SAAFXZ", "SAAGMX", "SAAGVE", "SAAKTZ", "SAANDA", "SAAPNI", "SAAPUL"))) %>% 
+  select(-timepoint) %>% 
+  rename(PFS_time = "Progression.Free.Survival.Time",
+         timepoint = "Timepoint") %>% 
+  filter(!is.na(PFS_time) & (PFS_time < 80)) %>% 
+  mutate(timepoint = parse_factor(timepoint,
+                                  levels = c("PRE", "OT", "EOS")),
+         ordered = TRUE)
+
+```
+
+#Make some of the columns easier for downstream work on strings 
+```{r}
+data_tb <- full_data %>% 
+  mutate(Mut_aa = if_else(Variant_type == "CNV",
+                          "CNV",
+                          Mut_aa),
+         Mut_aa = if_else(Variant_type == "NONE",
+                          "NONE",
+                          Mut_aa),
+         Mut_aa = if_else(Variant_type == "Indel",
+                          "Indel",
+                          Mut_aa),
+         Mut_aa = if_else((Variant_type == "SNV" & is.na(Mut_aa)),
+                          VAR_TYPES,
+                          Mut_aa)) %>% 
+  mutate(VAR_TYPES = if_else((is.na(VAR_TYPES) & Variant_type == "CNV"),
+                             "CNV",
+                             VAR_TYPES),
+         VAR_TYPES = if_else((is.na(VAR_TYPES) & Gene == "NONE"),
+                             "NONE",
+                             VAR_TYPES)) %>% 
+  unite(gene_mutation, Gene, Mut_aa, 
+        sep = "-", remove = FALSE,
+        na.rm = FALSE) %>% 
+  mutate(gene_mutation = if_else(Variant_type == "NONE",
+                                 "NONE",
+                                 gene_mutation))
+
+
+```
