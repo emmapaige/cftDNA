@@ -155,7 +155,7 @@ find.pairwise.group.mutation.delta <- function(mat) {
 ```{r}
 #### load data
 
-full_data <- read_xlsx(here("20190118_GNE01_Cumulative_Results_Report_annotated.xlsx")) %>% 
+full_data <- read_xlsx(here("Data/20190118_GNE01_Cumulative_Results_Report_annotated.xlsx")) %>% 
   separate(Customer.SampleId, 
            c("customer", "sampleId"), 
            sep = "-", 
@@ -874,6 +874,9 @@ my_homogeneity_test(arm_gene_mat)$p_value#[1] 0.003483149
 #### using N_total
 my_homogeneity_test(arm_gene_mat)$p_value#[1] 0.0002885396
 
+```
+
+```{r}
 #### gene-variant
 pre_arm_gene_variant_mat <- arm_gene_variant_tb %>% 
   select(-N_total) %>% 
@@ -892,7 +895,9 @@ my_homogeneity_test(arm_gene_variant_mat)$p_value#[1] 0.0008191125
 
 #### using N_total
 my_homogeneity_test(arm_gene_variant_mat)$p_value#[1] 1.088052e-05
+```
 
+```{r}
 #### gene-allele
 pre_arm_gene_allele_mat <- arm_gene_allele_tb %>% 
   select(-N_total) %>% 
@@ -912,6 +917,423 @@ my_homogeneity_test(arm_gene_allele_mat)$p_value#[1] 8.080541e-25
 #### using N_total
 my_homogeneity_test(arm_gene_allele_mat)$p_value#[1] 3.829418e-25
 
+```
+
+Q: between the timepoints?
+
+```{r}
+pre_timepoint_gene_mat <- timepoint_gene_tb %>% 
+  select(-N_total) %>% 
+  pivot_wider(names_from = Gene, values_from = N_patient, values_fill = 0)
+# select(-N_patient) %>% 
+# pivot_wider(names_from = Gene, values_from = N_total, values_fill = 0)
+
+timepoint_gene_mat <- pre_timepoint_gene_mat %>%  
+  select(-timepoint) %>% 
+  as.matrix()
+rownames(timepoint_gene_mat) <- pre_timepoint_gene_mat %>% pull(timepoint)
+```
+
+```{r}
+#### using N_patient
+my_homogeneity_test(timepoint_gene_mat)
+# group_1 group_2  p_value
+# <chr>   <chr>      <dbl>
+# 1 PRE     OT      5.56e-20
+# 2 PRE     EOS     1.46e- 3
+# 3 OT      EOS     3.15e- 1
+```
+
+I am not getting the same results here?
+```{r}
+#### using N_total
+my_homogeneity_test(timepoint_gene_mat)
+# group_1 group_2  p_value
+# <chr>   <chr>      <dbl>
+# 1 PRE     OT      5.24e-21
+# 2 PRE     EOS     1.77e- 3
+# 3 OT      EOS     1.63e- 1
+```
+
+```{r}
+#### gene-variant
+pre_timepoint_gene_variant_mat <- timepoint_gene_variant_tb %>% 
+  select(-N_total) %>% 
+  pivot_wider(names_from = gene_variant, values_from = N_patient, values_fill = 0)
+# select(-N_patient) %>% 
+# pivot_wider(names_from = gene_variant, values_from = N_total, values_fill = 0)
+
+timepoint_gene_variant_mat <- pre_timepoint_gene_variant_mat %>%  
+  select(-timepoint) %>% 
+  as.matrix()
+rownames(timepoint_gene_variant_mat) <- pre_timepoint_gene_variant_mat %>% pull(timepoint)
+```
+
+```{r}
+#### using N_patient
+my_homogeneity_test(timepoint_gene_variant_mat)
+```
+Again not sure what is going on here
+```{r}
+#### using N_total
+my_homogeneity_test(timepoint_gene_variant_mat)
+# group_1 group_2  p_value
+# <chr>   <chr>      <dbl>
+# 1 PRE     OT      9.63e-25
+# 2 PRE     EOS     3.38e- 5
+# 3 OT      EOS     1.86e- 1
+```
+
+```{r}
+#### gene-allele
+pre_timepoint_gene_allele_mat <- timepoint_gene_allele_tb %>% 
+  select(-N_total) %>% 
+  pivot_wider(names_from = gene_mutation, values_from = N_patient, values_fill = 0)
+# select(-N_patient) %>% 
+# pivot_wider(names_from = gene_mutation, values_from = N_total, values_fill = 0)
+
+timepoint_gene_allele_mat <- pre_timepoint_gene_allele_mat %>%  
+  select(-timepoint) %>% 
+  as.matrix()
+rownames(timepoint_gene_allele_mat) <- pre_timepoint_gene_allele_mat %>% pull(timepoint)
+```
+
+```{r}
+#### using N_patient
+my_homogeneity_test(timepoint_gene_allele_mat)
+# group_1 group_2 p_value
+# <chr>   <chr>     <dbl>
+# 1 PRE     OT       0.0159
+# 2 PRE     EOS      1.00  
+# 3 OT      EOS      1.00  
+```
+#Not sure what is going on here
+```{r}
+#### using N_total
+my_homogeneity_test(timepoint_gene_allele_mat)
+# group_1 group_2 p_value
+# <chr>   <chr>     <dbl>
+# 1 PRE     OT       0.0120
+# 2 PRE     EOS      1.00  
+```
+
+Q: between the PFS quartiles?
+
+```{r}
+#### genes
+pre_class_gene_mat <- class_gene_tb %>% 
+  select(-N_total) %>% 
+  pivot_wider(names_from = Gene, values_from = N_patient, values_fill = 0)
+# select(-N_patient) %>% 
+# pivot_wider(names_from = Gene, values_from = N_total, values_fill = 0)
+
+class_gene_mat <- pre_class_gene_mat %>%  
+  select(-tumor_class) %>% 
+  as.matrix()
+rownames(class_gene_mat) <- pre_class_gene_mat %>% pull(tumor_class)
+
+```
+
+```{r}
+#### using N_patient
+my_homogeneity_test(class_gene_mat)
+# group_1 group_2   p_value
+# <chr>   <chr>       <dbl>
+# 1 Q1      Q2      0.0000105
+# 2 Q2      Q4      0.0000290
+# 3 Q1      Q4      0.000521 
+# 4 Q1      Q3      0.000842 
+# 5 Q2      Q3      0.000951 
+# 6 Q3      Q4      0.0179  
+```
+Why do we keep repeating the same thing?
+```{r}
+#### using N_total
+my_homogeneity_test(class_gene_mat)
+# group_1 group_2      p_value
+# <chr>   <chr>          <dbl>
+# 1 Q1      Q2      0.0000000753
+# 2 Q1      Q4      0.000000587 
+# 3 Q2      Q4      0.00000339  
+# 4 Q1      Q3      0.00000837  
+# 5 Q2      Q3      0.000392    
+# 6 Q3      Q4      0.00992 
+```
+```{r}
+#### gene-variant
+pre_class_gene_variant_mat <- class_gene_variant_tb %>% 
+  select(-N_total) %>% 
+  pivot_wider(names_from = gene_variant, values_from = N_patient, values_fill = 0)
+# select(-N_patient) %>% 
+# pivot_wider(names_from = gene_variant, values_from = N_total, values_fill = 0)
+
+class_gene_variant_mat <- pre_class_gene_variant_mat %>%  
+  select(-tumor_class) %>% 
+  as.matrix()
+rownames(class_gene_variant_mat) <- pre_class_gene_variant_mat %>% pull(tumor_class)
+```
+
+```{r}
+#### using N_patient
+my_homogeneity_test(class_gene_variant_mat)
+# group_1 group_2    p_value
+# <chr>   <chr>        <dbl>
+# 1 Q1      Q2      0.00000357
+# 2 Q1      Q4      0.00000778
+# 3 Q2      Q4      0.0000219 
+# 4 Q1      Q3      0.000558  
+# 5 Q2      Q3      0.00122   
+# 6 Q3      Q4      0.0330
+```
+
+repeat
+```{r}
+#### using N_total
+my_homogeneity_test(class_gene_variant_mat)
+# group_1 group_2       p_value
+# <chr>   <chr>           <dbl>
+# 1 Q1      Q4      0.00000000123
+# 2 Q1      Q2      0.00000000530
+# 3 Q1      Q3      0.000000873  
+# 4 Q2      Q4      0.00000961   
+# 5 Q2      Q3      0.000306     
+# 6 Q3      Q4      0.0100  
+```
+```{r}
+#### gene-allele
+pre_class_gene_allele_mat <- class_gene_allele_tb %>% 
+  select(-N_total) %>% 
+  pivot_wider(names_from = gene_mutation, values_from = N_patient, values_fill = 0)
+# select(-N_patient) %>% 
+# pivot_wider(names_from = gene_mutation, values_from = N_total, values_fill = 0)
+
+class_gene_allele_mat <- pre_class_gene_allele_mat %>%  
+  select(-tumor_class) %>% 
+  as.matrix()
+rownames(class_gene_allele_mat) <- pre_class_gene_allele_mat %>% pull(tumor_class)
+```
+
+```{r}
+#### using N_patient
+my_homogeneity_test(class_gene_allele_mat)
+# group_1 group_2  p_value
+# <chr>   <chr>      <dbl>
+# 1 Q1      Q2      4.10e-20
+# 2 Q1      Q3      8.89e-18
+# 3 Q1      Q4      1.42e-14
+# 4 Q2      Q4      2.38e-11
+# 5 Q2      Q3      5.82e-11
+# 6 Q4      Q3      1.68e- 6
+```
+
+```{r}
+#### using N_total
+my_homogeneity_test(class_gene_allele_mat)
+# group_1 group_2  p_value
+# <chr>   <chr>      <dbl>
+# 1 Q1      Q2      1.88e-20
+# 2 Q1      Q3      1.68e-18
+# 3 Q1      Q4      2.34e-15
+# 4 Q2      Q4      2.07e-11
+# 5 Q2      Q3      3.68e-11
+# 6 Q4      Q3      1.01e- 6
+```
+
+Q: between all possible patient groups?
+
+```{r}
+#### genes
+pre_gene_mat <- timepoint_arm_class_gene_tb %>% 
+  rename(group = `Time-Arm-Quartile`) %>% 
+  select(-c(timepoint, Arm, tumor_class, N_total)) %>% 
+  pivot_wider(names_from = Gene, values_from = N_patient, values_fill = 0)
+# select(-c(timepoint, Arm, tumor_class, N_patient)) %>% 
+# pivot_wider(names_from = Gene, values_from = N_total, values_fill = 0)
+
+gene_mat <- pre_gene_mat %>%  
+  select(-group) %>%  
+  as.matrix()
+rownames(gene_mat) <- pre_gene_mat %>% pull(group)
+```
+
+```{r}
+#Chi square test
+gene_pvalue_tb <- my_homogeneity_test(gene_mat) %>% 
+  separate(group_1, into = str_c(c('timepoint', 'Arm', 'tumor_class'), 1, sep = '_'), sep = '-') %>% 
+  separate(group_2, into = str_c(c('timepoint', 'Arm', 'tumor_class'), 2, sep = '_'), sep = '-')
+
+gene_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 == tumor_class_2, Arm_1 != Arm_2)
+
+gene_pvalue_tb %>% 
+  filter(timepoint_1 != timepoint_2, tumor_class_1 == tumor_class_2, Arm_1 == Arm_2)
+
+gene_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 != tumor_class_2, Arm_1 == Arm_2)
+
+```
+
+```{r}
+#### gene-variant
+pre_gene_variant_mat <- timepoint_arm_class_gene_variant_tb %>% 
+  rename(group = `Time-Arm-Quartile`) %>%
+  select(-c(timepoint, Arm, tumor_class, N_total)) %>% 
+  pivot_wider(names_from = gene_variant, values_from = N_patient, values_fill = 0)
+# select(-c(timepoint, Arm, tumor_class, N_patient)) %>% 
+# pivot_wider(names_from = gene_variant, values_from = N_total, values_fill = 0)
+
+gene_variant_mat <- pre_gene_variant_mat %>%  
+  select(-group) %>% 
+  as.matrix()
+rownames(gene_variant_mat) <- pre_gene_variant_mat %>% pull(group)
+```
+
+```{r}
+gene_variant_pvalue_tb <- my_homogeneity_test(gene_variant_mat) %>% 
+  separate(group_1, into = str_c(c('timepoint', 'Arm', 'tumor_class'), 1, sep = '_'), sep = '-') %>% 
+  separate(group_2, into = str_c(c('timepoint', 'Arm', 'tumor_class'), 2, sep = '_'), sep = '-')
+
+gene_variant_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 == tumor_class_2, Arm_1 != Arm_2)
+
+gene_variant_pvalue_tb %>% 
+  filter(timepoint_1 != timepoint_2, tumor_class_1 == tumor_class_2, Arm_1 == Arm_2)
+
+gene_variant_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 != tumor_class_2, Arm_1 == Arm_2)
+
+```
+
+```{r}
+#### gene-allele
+pre_gene_allele_mat <- timepoint_arm_class_gene_allele_tb %>% 
+  rename(group = `Time-Arm-Quartile`) %>% 
+  select(-c(timepoint, Arm, tumor_class, N_total)) %>% 
+  pivot_wider(names_from = gene_mutation, values_from = N_patient, values_fill = 0)
+# select(-c(timepoint, Arm, tumor_class, N_patient)) %>% 
+# pivot_wider(names_from = gene_mutation, values_from = N_total, values_fill = 0)
+
+gene_allele_mat <- pre_gene_allele_mat %>%  
+  select(-group) %>% 
+  as.matrix()
+rownames(gene_allele_mat) <- pre_gene_allele_mat %>% pull(group)
+```
+
+```{r}
+gene_allele_pvalue_tb <- my_homogeneity_test(gene_allele_mat) %>% 
+  separate(group_1, into = str_c(c('timepoint', 'Arm', 'tumor_class'), 1, sep = '_'), sep = '-') %>% 
+  separate(group_2, into = str_c(c('timepoint', 'Arm', 'tumor_class'), 2, sep = '_'), sep = '-')
+
+gene_allele_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 == tumor_class_2, Arm_1 != Arm_2)
+
+gene_allele_pvalue_tb %>% 
+  filter(timepoint_1 != timepoint_2, tumor_class_1 == tumor_class_2, Arm_1 == Arm_2)
+
+gene_allele_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 != tumor_class_2, Arm_1 == Arm_2)
+
+```
+
+Q: between PFS quartile and timepoint patient groups?
+
+```{r}
+#### genes
+pre_time_class_gene_mat <- timepoint_class_gene_tb %>% 
+  rename(group = `Time-Quartile`) %>% 
+  select(-c(timepoint, tumor_class, N_total)) %>% 
+  pivot_wider(names_from = Gene, values_from = N_patient, values_fill = 0)
+
+time_class_gene_mat <- pre_time_class_gene_mat %>%  
+  select(-group) %>%  
+  as.matrix()
+rownames(time_class_gene_mat) <- pre_time_class_gene_mat %>% pull(group)
+```
+
+```{r}
+time_class_gene_pvalue_tb <- my_homogeneity_test(time_class_gene_mat) %>% 
+  separate(group_1, into = str_c(c('timepoint', 'tumor_class'), 1, sep = '_'), sep = '-') %>% 
+  separate(group_2, into = str_c(c('timepoint', 'tumor_class'), 2, sep = '_'), sep = '-')
+
+time_class_gene_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 != tumor_class_2)
+
+time_class_gene_pvalue_tb %>% 
+  filter(timepoint_1 != timepoint_2, tumor_class_1 == tumor_class_2)
+
+time_class_gene_delta_tb <- find.pairwise.group.mutation.delta(time_class_gene_mat) %>% 
+  separate(group_1, into = str_c(c('timepoint', 'tumor_class'), 1, sep = '_'), sep = '-', remove = FALSE) %>% 
+  separate(group_2, into = str_c(c('timepoint', 'tumor_class'), 2, sep = '_'), sep = '-', remove = FALSE)
+
+```
+
+Plot
+```{r}
+p <- time_class_gene_delta_tb %>% 
+  group_by(comparison) %>% 
+  slice_max(order_by = abs(delta), n = 15) %>% 
+  filter(timepoint_1 == timepoint_2, timepoint_1 == 'OT', tumor_class_1 != tumor_class_2) %>%
+  ggplot(aes(mutation, delta)) + 
+  geom_col(fill = 'purple') + 
+  scale_x_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  facet_wrap( ~ comparison, scales = 'free') + 
+  coord_flip() + 
+  theme(legend.position = 'none', axis.text.y = element_text(size = 7)) + 
+  ylab('delta [(N_patient in group 1) - (N_patient in group 2)] per gene')
+ggsave('Emma_Plots/PFS_gene_mutation_delta_at_OT_timepoint.png',
+       p)
+
+p
+
+```
+
+Emma Stopped here
+```{r}
+#### gene-variant
+pre_time_class_gene_variant_mat <- timepoint_class_gene_variant_tb %>% 
+  rename(group = `Time-Quartile`) %>% 
+  select(-c(timepoint, tumor_class, N_total)) %>%  
+  pivot_wider(names_from = gene_variant, values_from = N_patient, values_fill = 0)
+
+time_class_gene_variant_mat <- pre_time_class_gene_variant_mat %>%  
+  select(-group) %>% 
+  as.matrix()
+rownames(time_class_gene_variant_mat) <- pre_time_class_gene_variant_mat %>% pull(group)
+
+time_class_gene_variant_pvalue_tb <- my_homogeneity_test(time_class_gene_variant_mat) %>% 
+  separate(group_1, into = str_c(c('timepoint', 'tumor_class'), 1, sep = '_'), sep = '-') %>% 
+  separate(group_2, into = str_c(c('timepoint', 'tumor_class'), 2, sep = '_'), sep = '-')
+```
+
+```{r}
+time_class_gene_variant_pvalue_tb %>% 
+  filter(timepoint_1 == timepoint_2, tumor_class_1 != tumor_class_2)
+
+time_class_gene_variant_pvalue_tb %>% 
+  filter(timepoint_1 != timepoint_2, tumor_class_1 == tumor_class_2)
+
+time_class_gene_variant_delta_tb <- find.pairwise.group.mutation.delta(time_class_gene_variant_mat) %>% 
+  separate(group_1, into = str_c(c('timepoint', 'tumor_class'), 1, sep = '_'), sep = '-', remove = FALSE) %>% 
+  separate(group_2, into = str_c(c('timepoint', 'tumor_class'), 2, sep = '_'), sep = '-', remove = FALSE)
+```
+
+Plot
+```{r}
+p <- time_class_gene_variant_delta_tb %>% 
+  group_by(comparison) %>% 
+  slice_max(order_by = abs(delta), n = 15) %>% 
+  filter(timepoint_1 == timepoint_2, timepoint_1 == 'OT', tumor_class_1 != tumor_class_2) %>%
+  ggplot(aes(mutation, delta)) + 
+  geom_col(fill = 'purple') + 
+  scale_x_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  facet_wrap( ~ comparison, scales = 'free') + 
+  coord_flip() + 
+  theme(legend.position = 'none', axis.text.y = element_text(size = 7)) + 
+  ylab('delta [(N_patient in group 1) - (N_patient in group 2)] per gene')
+ggsave('Emma_plots/PFS_gene_variant_mutation_delta_at_OT_timepoint.png',
+       p)
+
+p
 ```
 
 
